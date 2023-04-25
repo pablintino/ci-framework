@@ -6,10 +6,15 @@
 - hosts: "{{ cifmw_target_host | default('localhost') }}"
   gather_facts: false
   tasks:
-    - name: Create and provision external computes
-      ansible.builtin.include_role:
-        name: libvirt_manager
-        tasks_from: deploy_edpm_compute.yml
+  - name: Create and provision external computes
+    ansible.builtin.include_role:
+      name: libvirt_manager
+      tasks_from: deploy_edpm_compute.yml
+
+  - name: Call predeploy
+    ansible.builtin.include_role:
+      name: edpm_prepare
+
 
 - name: Run post_deploy hooks
   vars:

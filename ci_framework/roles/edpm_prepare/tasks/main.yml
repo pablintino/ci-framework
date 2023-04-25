@@ -1,0 +1,98 @@
+- name: Prepare storage in CRC
+  when:
+    - cifmw_use_crc is defined
+    - cifmw_use_crc | bool
+  ansible.builtin.include_role:
+    name: 'install_yamls_makes'
+    tasks_from: 'make_crc_storage'
+
+- name: Create install_yamls output directory
+  ansible.builtin.file:
+    path: "{{ cifmw_edpm_prepare_intall_yamls_output_dir }}"
+    state: directory
+
+- name: Set install_yamls Makefile environment variables
+  ansible.builtin.set_fact:
+    cifmw_edpm_prepare_common_env: |
+      OUT: {{ cifmw_edpm_prepare_intall_yamls_output_dir }}
+    cifmw_edpm_prepare_make_openstack_env: |
+      {% if cifmw_operator_build_meta_name in cifmw_operator_build_output.operators %}
+      OPENSTACK_IMG: {{ cifmw_operator_build_output.operators[cifmw_operator_build_meta_name].image }}
+      {% endif %}
+    cifmw_edpm_prepare_make_openstack_deploy_env: |
+      {% if cifmw_operator_build_meta_name in cifmw_operator_build_output.operators %}
+      OPENSTACK_BRANCH: ""
+      GIT_CLONE_OPTS: "-l"
+      OPENSTACK_REPO: cifmw_operator_build_output.operators[cifmw_operator_build_meta_name].git_src_dir
+      {% endif %}
+
+- name: Prepare inputs
+  vars:
+    make_input_env: "{{ cifmw_edpm_prepare_common_env | from_yaml }}"
+  ansible.builtin.include_role:
+    name: 'install_yamls_makes'
+    tasks_from: 'make_input'
+
+# TODO: Prepare a proper operator list that dictates what operators to deploy instead of relaying on a simple flag
+- name: OpenStack meta-operator installation
+  when: not cifmw_edpm_skip_openstack_operator
+  block:
+  - name: Install OpenStack operator
+    vars:
+      make_openstack_env: "{{ cifmw_edpm_prepare_common_env | from_yaml |
+        combine(cifmw_edpm_prepare_make_openstack_env | from_yaml)}}"
+    ansible.builtin.include_role:
+      name: 'install_yamls_makes'
+      tasks_from: 'make_openstack'
+
+  - name: Wait for OpenStack subscription creation
+    ansible.builtin.shell: |
+      oc get sub openstack-operator --namespace={{ cifmw_install_yamls_defaults['NAMESPACE'] }} > /dev/null 2>&1 &&
+        oc get sub openstack-operator --namespace={{ cifmw_install_yamls_defaults['NAMESPACE'] }} -o=jsonpath='{.status.installplan.name}'
+    until: cifmw_edpm_prepare_wait_installplan_out.rc == 0 and cifmw_edpm_prepare_wait_installplan_out.stdout != ""
+    register: cifmw_edpm_prepare_wait_installplan_out
+    retries: 30
+    delay: 5
+
+  - name: Wait for OpenStack operator to get installed
+    ansible.builtin.command:
+      cmd: >
+        oc wait InstallPlan {{ cifmw_edpm_prepare_wait_installplan_out.stdout }}
+        --namespace={{ cifmw_install_yamls_defaults['NAMESPACE'] }} --for=jsonpath='{.status.phase}'=Complete --timeout=20m
+
+- name: Install OpenStack service
+  vars:
+    make_openstack_deploy_env: "{{ cifmw_edpm_prepare_common_env | from_yaml |
+      combine(cifmw_edpm_prepare_make_openstack_deploy_env | from_yaml)}}"
+  ansible.builtin.include_role:
+    name: 'install_yamls_makes'
+    tasks_from: 'make_openstack_deploy'
+
+- name: Find the OpenStack CR manifest
+  ansible.builtin.find:
+    paths: "{{ cifmw_edpm_prepare_intall_yamls_output_dir }}/{{ cifmw_install_yamls_defaults['NAMESPACE'] }}/openstack/cr"
+    contains: "kind: OpenStackControlPlane"
+    patterns: "*.yaml"
+  register: cifmw_edpm_prepare_openstack_cr_manifest_paths
+
+- name: Ensure manifest exists
+  ansible.builtin.assert:
+    that: cifmw_edpm_prepare_openstack_cr_manifest_paths.matched == 1
+    quiet: true
+    msg: "Cannot determine OpenStackControlPlane deployment manifest"
+
+- name: Find files out
+  ansible.builtin.set_fact:
+    cifmw_edpm_prepare_ctrlplane_cr_name: |-
+      {{  (
+            lookup('ansible.builtin.template', cifmw_edpm_prepare_openstack_cr_manifest_paths.files[0].path) | from_yaml
+          ).metadata.name
+      }}
+
+- name: Wait for OpenStack controlplane to be deployed
+  ansible.builtin.command:
+    cmd: >-
+      oc wait OpenStackControlPlane {{ cifmw_edpm_prepare_ctrlplane_cr_name }}
+      --namespace={{ cifmw_install_yamls_defaults['NAMESPACE'] }}
+      --for=condition=ready
+      --timeout=30m
